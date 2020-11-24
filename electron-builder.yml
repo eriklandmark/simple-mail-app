@@ -1,0 +1,17 @@
+appId: se.landmark.simple-mail-app
+productName: Simple Mail App
+copyright: Copyright © 2020 Erik Landmark
+win:
+  target: nsis
+  icon: ./public/icon.png
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+mac:
+  icon: ./public/icon.png
+linux:
+  category: utility
+  icon: ./public/icon.png
+  target:
+    target: 'appimage'
+    arch: ['armv7l']
