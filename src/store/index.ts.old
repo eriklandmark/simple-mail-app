@@ -1,0 +1,314 @@
+import Vue from 'vue'
+import Vuex from 'vuex'
+import {google} from "googleapis";
+import express from "express"
+import axios from "axios"
+
+import {createUserStorage} from "@/store/user_storage_module";
+import * as imap_helper from "@/store/imap_helper";
+import {Account, Mail, MailBox} from "@/store/imap_helper";
+
+const gmail_secrets = require("@/assets/google_oauth_client_secret.json")
+const electron = require('electron')
+const imap = require("imap-simple")
+
+Vue.use(Vuex)
+
+function getJsonFromUrl(uri: string) {
+    let query = uri.substr(uri.indexOf("?") + 1);
+    let result: any = {};
+
+    query.split("&").forEach((part: string) => {
+        let item: string[] = part.split("=");
+        result[item[0]] = decodeURIComponent(item[1]);
+    });
+
+    return result;
+}
+
+async function gmail_request(path: string, oauth_client: any, variables: any = {}) {
+    const access_token = (await oauth_client.getAccessToken()).token
+    const result = await axios.get("https://gmail.googleapis.com/gmail/v1" + path,
+        {
+            headers: {
+                "Authorization": "Bearer " + access_token
+            }, params: variables
+        })
+    return result.data
+}
+
+function decodeBodyData(input: { size: number, data: string }): string {
+    return Buffer.alloc(input.size, input.data, "base64").toString();
+}
+
+export default new Vuex.Store({
+    state: {
+        accounts: {} as { [propName: string]: Account },
+        connections: {} as any,
+        selectedMailBox: {
+            email: "",
+            box_id: ""
+        },
+        selectedMail: {}
+    },
+    mutations: {
+        addAccount(state, account: Account) {
+            Vue.set(state.accounts, account.email, account)
+        },
+
+        setMailBoxes(state, {email, mail_boxes}) {
+            Vue.set(state.accounts[email], "mail_boxes", mail_boxes)
+        },
+
+        setMailBox(state, {email, mail_box}) {
+            state.accounts[email].mail_boxes[mail_box.id] = mail_box
+            Vue.set(state.accounts[email].mail_boxes, mail_box.id, mail_box)
+        },
+
+        setCurrentMailBox(state, details) {
+            state.selectedMailBox = details
+        },
+
+        setCurrentMail(state, details) {
+            state.selectedMail = details
+        },
+
+        setConnection(state, {email, connection}) {
+            state.connections[email] = connection
+        },
+
+        updateRefreshToken(state, {email, token}) {
+            state.accounts[email].secrets.refresh_token = token
+        }
+    },
+    actions: {
+        async initAccounts(store, details) {
+            await Promise.all(Object.keys(store.state.accounts)
+                .map((email: string) => store.dispatch("initAccount", store.state.accounts[email])))
+            console.log("Loaded accounts!")
+        },
+
+        async initAccount(store, account: Account) {
+            if (account.provider == "google") {
+                const oauth2Client = new google.auth.OAuth2(
+                    gmail_secrets.installed.client_id,
+                    gmail_secrets.installed.client_secret,
+                    gmail_secrets.installed.redirect_uris[1]
+                );
+
+                oauth2Client.on('tokens', (tokens) => {
+                    if (tokens.refresh_token) {
+                        store.commit("updateRefreshToken", {email: account.email, token: tokens.refresh_token})
+                    }
+                });
+                oauth2Client.setCredentials({refresh_token: account.secrets.refresh_token})
+                store.commit("setConnection", {email: account.email, connection: oauth2Client})
+
+                const result = await gmail_request(`/users/${account.email}/labels`, oauth2Client)
+                const listed_labels = await Promise.all(result.labels
+                    .filter((label: any) => label.type == "system" && !label.labelListVisibility)
+                    .map((label: any) => gmail_request(`/users/${account.email}/labels/${label.id}`, oauth2Client)))
+
+                const mail_boxes = listed_labels.reduce((acc: any, label: any) => {
+                    acc[label.id] = {
+                        id: label.id,
+                        messages: [],
+                        name: label.name,
+                        listed: true,
+                        unread_messages: label.messagesUnread,
+                        total_messages: label.messagesTotal,
+                        pinned: true
+                    } as MailBox
+                    return acc
+                }, {} as { [propName: string]: MailBox })
+                store.commit("setMailBoxes", {email: account.email, mail_boxes: mail_boxes})
+            } else if (account.provider == "other") {
+                const connection = await imap_helper.createConnection(account)
+                const mail_boxes = await imap_helper.initMailBoxes(connection, account)
+                store.commit("setConnection", {email: account.email, connection})
+                store.commit("setMailBoxes", {email: account.email, mail_boxes: mail_boxes})
+            }
+
+            store.dispatch("user_storage/save")
+        },
+
+        async addAccount(store, details) {
+            if (details.provider == "google") {
+                const oauth2Client = new google.auth.OAuth2(
+                    gmail_secrets.installed.client_id,
+                    gmail_secrets.installed.client_secret,
+                    gmail_secrets.installed.redirect_uris[1]
+                );
+
+                const auth_url = oauth2Client.generateAuthUrl({
+                    access_type: 'offline',
+                    scope: ["https://mail.google.com/", "https://www.googleapis.com/auth/userinfo.profile"]
+                });
+
+                const server = express()
+                server.use(express.json())
+
+                server.get("/", async (req, res) => {
+                    res.send("You can close this now!")
+                    try {
+                        const {code} = getJsonFromUrl(req.url)
+                        const {tokens} = await oauth2Client.getToken(code)
+                        oauth2Client.setCredentials(tokens);
+
+                        const result = await gmail_request(`/users/${details.email}/profile`, oauth2Client)
+                        console.log(result)
+                        if (result.emailAddress && result.emailAddress.toLowerCase() == details.email.toLowerCase()) {
+                            const account: Account = {
+                                email: result.emailAddress.toLowerCase(),
+                                name: result.emailAddress.toLowerCase(),
+                                provider: "google",
+                                secrets: {
+                                    refresh_token: tokens.refresh_token!
+                                },
+                                mail_boxes: {}
+                            }
+                            console.log("New Account", account)
+                            store.commit("addAccount", account)
+                            oauth2Client.on('tokens', (tokens) => {
+                                if (tokens.refresh_token) {
+                                    store.commit("updateRefreshToken", {
+                                        email: result.emailAddress,
+                                        token: tokens.refresh_token
+                                    })
+                                }
+                            });
+                            store.dispatch("initAccount", account)
+                        }
+                    } catch (e) {
+                        console.error(e)
+                    }
+
+                    //@ts-ignore
+                    instance.close(() => console.log("Server Closed!"))
+                })
+
+                const instance = server.listen({port: 4444, host: "0.0.0.0"}, async () => {
+                    console.log("Started auth server")
+                    await electron.shell.openExternal(auth_url)
+                })
+            } else if (details.provider == "other") {
+                try {
+                    const config = {
+                        imap: {
+                            user: details.email,
+                            password: details.password,
+                            host: details.host,
+                            port: details.port,
+                            tls: true,
+                            authTimeout: 5000,
+                            tlsOptions: {
+                                rejectUnauthorized: false,
+                                //servername: details.host,
+                                //secureProtocol: 'TLSv1.1'
+                            }
+                        }
+                    }
+
+                    const connection = await imap.connect(config)
+
+                    if (connection.imap.state == "authenticated") {
+                        const account: Account = {
+                            email: details.email.toLowerCase(),
+                            name: details.email.toLowerCase(),
+                            provider: "other",
+                            secrets: {
+                                host: details.host,
+                                port: details.port,
+                                password: details.password
+                            },
+                            mail_boxes: {}
+                        }
+
+                        console.log("New Account", account)
+                        store.commit("addAccount", account)
+                        store.dispatch("initAccount", account)
+                    }
+                } catch (e) {
+                    console.error(e)
+                    return e
+                }
+
+            }
+        },
+
+        async loadMailBox(store) {
+
+            const email = store.state.selectedMailBox.email
+            const box_id = store.state.selectedMailBox.box_id
+            const oauth2Client = store.state.connections[email]
+            const provider = store.state.accounts[email].provider
+
+            console.log("Loading mail box: ", email, " | ", box_id)
+
+            if (provider == "google") {
+                const result = await gmail_request(`/users/${email}/messages`, oauth2Client, {
+                    labelIds: box_id,
+                    p: "-from:me"
+                })
+
+                const messages = await Promise.all(result.messages
+                    .map((message: any) => gmail_request(`/users/${email}/messages/${message.id}`, oauth2Client)))
+
+                const getParts = (acc: any[], part: any) => {
+                    if (part.parts) {
+                        for (const p of part.parts) getParts(acc, p)
+                    } else {
+                        acc.push(part)
+                    }
+                }
+
+                const parsed_messages = messages.map((msg: any) => {
+                    let data = ""
+                    let type = ""
+
+                    if (msg.payload.parts) {
+                        let allParts: any[] = []
+                        for (const part of msg.payload.parts) getParts(allParts, part)
+
+                        const part = allParts.find((part: any) => part.mimeType.includes("html")) ||
+                            allParts.find((part: any) => part.mimeType.includes("plain"))
+                        if (part) {
+                            type = part.mimeType
+                            data = decodeBodyData(part.body)
+                        }
+                    } else if (msg.payload.mimeType == "text/plain" || msg.payload.mimeType == "text/html") {
+                        data = decodeBodyData(msg.payload.body)
+                        type = msg.payload.mimeType
+                    }
+
+                    const to_header = msg.payload.headers.find((header: any) => header.name == "To")
+                        || msg.payload.headers.find((header: any) => header.name == "Delivered-To")
+
+                    return {
+                        id: <string>msg.id,
+                        date: new Date(msg.payload.headers.find((header: any) => header.name == "Date").value),
+                        subject: <string>msg.payload.headers.find((header: any) => header.name == "Subject").value,
+                        from: <string>msg.payload.headers.find((header: any) => header.name == "From").value,
+                        to: <string>to_header.value,
+                        attachments: [],
+                        body: {
+                            type: type,
+                            data: data
+                        }
+                    } as Mail
+                })
+
+                const mail_box = store.state.accounts[email].mail_boxes[box_id]
+                mail_box.messages = parsed_messages
+                store.commit("setMailBox", {email, mail_box})
+
+            } else if (provider == "other") {
+                const connection = store.state.connections[email]
+                store.commit("setMailBox", {email, mail_box})
+            }
+        }
+    },
+    modules: {
+        user_storage: createUserStorage(["accounts"], {saveTo: "fs", always_save: true})
+    }
+})
